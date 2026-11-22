@@ -60,6 +60,24 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 
 A full list of supported settings and capabilities is available by running: `tap-jira --about`
 
+## Worklog deletion reconciliation
+
+Worklogs deleted in Jira do not disappear from downstream tables on their own.
+To handle this, the `issue_worklogs` stream keeps per-issue bookkeeping in the
+tap state (under `worklog_reconciliation`) and treats every sync of an issue as
+a complete re-check of that issue's worklog list:
+
+- When the list is read to completion, previously delivered worklog IDs that
+  are no longer returned are emitted as withdrawal markers: records containing
+  the worklog `id`, `issueId`, `withdrawn: true` and `withdrawnAt`. Downstream
+  queries should filter these out (e.g. `WHERE NOT withdrawn`).
+- When the read cannot be confirmed complete (pagination or permission
+  failure), no withdrawal markers are emitted. The issue is left in a
+  `reconciliation_pending` state and is re-checked at the end of the sync,
+  after the `issues` stream finishes.
+
+Rows that are not returned by an incomplete read are never treated as deleted.
+
 ## Elastic License 2.0
 
 The licensor grants you a non-exclusive, royalty-free, worldwide, non-sublicensable, non-transferable license to use, copy, distribute, make available, and prepare derivative works of the software.

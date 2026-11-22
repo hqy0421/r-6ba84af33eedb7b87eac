@@ -5,11 +5,13 @@ from __future__ import annotations
 import functools
 import operator
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
+import requests
 from singer_sdk import typing as th  # JSON Schema typing helpers
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.pagination import JSONPathPaginator, OffsetPaginator
 
 from tap_jira.client import JiraStartAtPaginatedStream, JiraStream, ResumableAPIError
@@ -22,7 +24,6 @@ else:
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    import requests
     from singer_sdk.helpers.types import Context, Record
 
 PropertiesList = th.PropertiesList
@@ -35,6 +36,21 @@ ArrayType = th.ArrayType
 BooleanType = th.BooleanType
 IntegerType = th.IntegerType
 NumberType = th.NumberType
+
+#: Exceptions meaning that a worklog list was not read to completion: transient
+#: request/pagination failures (surfacing after the SDK's own retries are
+#: exhausted) and fatal API errors such as permission failures. Anything else
+#: is unexpected and must abort the sync loudly.
+INCOMPLETE_READ_EXCEPTIONS: tuple[type[Exception], ...] = (
+    ResumableAPIError,
+    RetriableAPIError,
+    FatalAPIError,
+    ConnectionResetError,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.Timeout,
+)
 
 
 ADFRootBlockNode = ObjectType(
@@ -1891,6 +1907,19 @@ class IssueStream(JiraStream[str]):
         return params
 
     @override
+    def get_records(self, context: Context | None) -> Iterable[Record]:
+        """Get issue records, then re-check worklogs pending reconciliation.
+
+        Child streams are synced as each issue record is processed, so once
+        this generator is exhausted, every per-issue worklog re-check of the
+        run is done and issues left in pending-retry state can be swept.
+        """
+        yield from super().get_records(context)
+        for child_stream in self.child_streams or []:
+            if isinstance(child_stream, IssueWorklogs):
+                child_stream.sync_pending_reconciliations()
+
+    @override
     def post_process(self, row: Record, context: Context | None = None) -> Record:
         """Post-process the record.
 
@@ -3469,6 +3498,21 @@ class IssueWorklogs(JiraStartAtPaginatedStream):
     """Issue Worklogs.
 
     https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-worklogs/#api-rest-api-3-issue-issueidorkey-worklog-get
+
+    Worklogs deleted in Jira do not disappear from downstream tables on their
+    own, so every sync of an issue is treated as a complete re-check of that
+    issue's worklog list:
+
+    - When the list is read to completion, previously delivered worklog IDs
+      that are no longer returned are emitted as withdrawal markers
+      (``withdrawn: true`` records).
+    - When the read cannot be confirmed complete (pagination or permission
+      failure), no withdrawal markers are emitted and the issue is left in a
+      pending-retry state, to be re-checked by
+      :meth:`sync_pending_reconciliations` at the end of the sync.
+
+    Rows that are not returned by an incomplete read are never treated as
+    deleted.
     """
 
     """
@@ -3496,6 +3540,15 @@ class IssueWorklogs(JiraStartAtPaginatedStream):
 
     next_page_token_jsonpath = None  # type: ignore[assignment]
 
+    #: Stream-state key holding per-issue reconciliation bookkeeping.
+    reconciliation_state_key = "worklog_reconciliation"
+    #: Per-issue state key: worklog IDs delivered downstream so far.
+    delivered_ids_state_key = "delivered_worklog_ids"
+    #: Per-issue state key: whether the last complete re-check failed.
+    pending_state_key = "reconciliation_pending"
+    #: Per-issue state key: description of the last re-check failure.
+    error_state_key = "reconciliation_error"
+
     schema = PropertiesList(
         Property("id", StringType),
         Property("self", StringType),
@@ -3521,7 +3574,144 @@ class IssueWorklogs(JiraStartAtPaginatedStream):
         Property("started", DateTimeType),
         Property("timeSpentSeconds", IntegerType),
         Property("issueId", StringType),
+        Property("withdrawn", BooleanType),
+        Property("withdrawnAt", DateTimeType),
     ).to_dict()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the stream."""
+        super().__init__(*args, **kwargs)
+        # Issues already re-checked during this sync run. The pending-retry
+        # sweep skips these so a failure is not retried twice in one run.
+        self._rechecked_issue_ids: set[str] = set()
+
+    @override
+    def get_records(self, context: Context | None) -> Iterable[Record]:
+        """Get records, reconciling withdrawals for the issue in context."""
+        if context and "issue_id" in context:
+            yield from self._recheck_issue_worklogs(context)
+        else:
+            yield from super().get_records(context)
+
+    @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        """Post-process the record, adding the issue ID and withdrawal flag."""
+        if context and "issue_id" in context:
+            row.setdefault("issueId", str(context["issue_id"]))
+        row.setdefault("withdrawn", False)
+        return row
+
+    def _recheck_issue_worklogs(self, context: Context) -> Iterable[Record]:
+        """Yield the issue's worklogs and reconcile them against state.
+
+        Live records are yielded as they are read. Withdrawal markers are
+        yielded only after the issue's worklog list has been read to
+        completion; on a pagination or permission failure the issue is left
+        in a pending-retry state and no markers are produced.
+
+        Args:
+            context: Stream context holding the ``issue_id`` to re-check.
+
+        Yields:
+            Live worklog records, then one withdrawal marker per confirmed
+            deleted worklog.
+        """
+        issue_id = str(context["issue_id"])
+        self._rechecked_issue_ids.add(issue_id)
+        reconciliation: dict[str, Any] = self.stream_state.setdefault(
+            self.reconciliation_state_key,
+            {},
+        )
+        issue_state: dict[str, Any] = reconciliation.setdefault(issue_id, {})
+        delivered_ids = set(issue_state.get(self.delivered_ids_state_key, ()))
+        fresh_ids: set[str] = set()
+        failure: Exception | None = None
+
+        try:
+            for record in self.request_records(context):
+                fresh_ids.add(str(record["id"]))
+                yield record
+        except INCOMPLETE_READ_EXCEPTIONS as ex:
+            failure = ex
+
+        if failure is not None:
+            # The read was not confirmed complete: rows not returned must not
+            # be treated as deleted. Keep every delivered ID, remember the IDs
+            # that were emitted, and leave only a pending-retry state.
+            delivered_ids |= fresh_ids
+            if delivered_ids:
+                issue_state[self.delivered_ids_state_key] = sorted(delivered_ids)
+            issue_state[self.pending_state_key] = True
+            issue_state[self.error_state_key] = str(failure)[:500]
+            self.logger.warning(
+                "Did not finish reading worklogs for issue %s; leaving "
+                "pending-retry state and emitting no withdrawal markers: %s",
+                issue_id,
+                failure,
+            )
+            return
+
+        # The read is confirmed complete: any delivered ID not returned is a
+        # confirmed deletion and gets a withdrawal marker.
+        withdrawn_ids = sorted(delivered_ids - fresh_ids)
+        withdrawn_at = datetime.now(tz=timezone.utc).isoformat()
+        for worklog_id in withdrawn_ids:
+            yield {
+                "id": worklog_id,
+                "issueId": issue_id,
+                "withdrawn": True,
+                "withdrawnAt": withdrawn_at,
+            }
+
+        if withdrawn_ids:
+            self.logger.info(
+                "Confirmed complete worklog read for issue %s: withdrew %d worklog(s)",
+                issue_id,
+                len(withdrawn_ids),
+            )
+
+        issue_state.pop(self.pending_state_key, None)
+        issue_state.pop(self.error_state_key, None)
+        if fresh_ids:
+            issue_state[self.delivered_ids_state_key] = sorted(fresh_ids)
+        else:
+            # Nothing left to track for this issue.
+            reconciliation.pop(issue_id, None)
+
+    def sync_pending_reconciliations(self) -> None:
+        """Re-check issues whose last worklog read did not complete.
+
+        For every issue in pending-retry state, run a complete re-check and
+        emit the resulting records, including withdrawal markers when the
+        re-check reads the issue's worklog list to completion. Issues already
+        re-checked during this run are skipped.
+        """
+        if not self.selected:
+            return
+
+        reconciliation: dict[str, Any] = self.stream_state.get(
+            self.reconciliation_state_key,
+            {},
+        )
+        pending_issue_ids = [
+            issue_id
+            for issue_id, issue_state in reconciliation.items()
+            if issue_state.get(self.pending_state_key)
+            and issue_id not in self._rechecked_issue_ids
+        ]
+        if not pending_issue_ids:
+            return
+
+        self.logger.info(
+            "Re-checking worklogs for %d issue(s) with pending reconciliation",
+            len(pending_issue_ids),
+        )
+        self._write_schema_message()
+        for issue_id in pending_issue_ids:
+            context: Context = {"issue_id": issue_id}
+            for record in self._recheck_issue_worklogs(context):
+                self._write_record_message(self.post_process(record, context))
+            self._write_state_message()
 
 
 class ComponentStream(JiraStartAtPaginatedStream):
